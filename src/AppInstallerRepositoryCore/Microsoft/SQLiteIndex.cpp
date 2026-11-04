@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "SQLiteIndex.h"
-#include "Schema/MetadataTable.h"
+#include <winget/SQLiteStorageBase.h>
 #include "ArpVersionValidation.h"
 #include <winget/ManifestYamlParser.h>
 
@@ -10,30 +10,19 @@ namespace AppInstaller::Repository::Microsoft
 {
     namespace
     {
-        char const* const GetOpenDispositionString(SQLiteIndex::OpenDisposition disposition)
+        size_t GetPageSizeFromOptions(SQLiteIndex::CreateOptions options)
         {
-            switch (disposition)
-            {
-            case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::Read:
-                return "Read";
-            case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::ReadWrite:
-                return "ReadWrite";
-            case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::Immutable:
-                return "ImmutableRead";
-            default:
-                return "Unknown";
-            }
+            return WI_IsFlagSet(options, SQLiteIndex::CreateOptions::LargePageSize) ? 65536 : 0;
         }
     }
 
-    SQLiteIndex SQLiteIndex::CreateNew(const std::string& filePath, Schema::Version version, CreateOptions options)
+    SQLiteIndex SQLiteIndex::CreateNew(const std::string& filePath, SQLite::Version version, CreateOptions options)
     {
-        AICLI_LOG(Repo, Info, << "Creating new SQLite Index [" << version << "] at '" << filePath << "'");
-        SQLiteIndex result{ filePath, version };
+        AICLI_LOG(Repo, Info, << "Creating new SQLite Index with version [" << version << "] at '" << filePath << "'");
+        SQLiteIndex result{ filePath, version, options };
 
         SQLite::Savepoint savepoint = SQLite::Savepoint::Create(result.m_dbconn, "sqliteindex_createnew");
 
-        Schema::MetadataTable::Create(result.m_dbconn);
         // Use calculated version, as incoming version could be 'latest'
         result.m_version.SetSchemaVersion(result.m_dbconn);
 
@@ -48,87 +37,105 @@ namespace AppInstaller::Repository::Microsoft
 
     SQLiteIndex SQLiteIndex::Open(const std::string& filePath, OpenDisposition disposition, Utility::ManagedFile&& indexFile)
     {
-        AICLI_LOG(Repo, Info, << "Opening SQLite Index for " << GetOpenDispositionString(disposition) << " at '" << filePath << "'");
-        switch (disposition)
-        {
-        case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::Read:
-            return { filePath, SQLite::Connection::OpenDisposition::ReadOnly, SQLite::Connection::OpenFlags::None, std::move(indexFile) };
-        case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::ReadWrite:
-            return { filePath, SQLite::Connection::OpenDisposition::ReadWrite, SQLite::Connection::OpenFlags::None, std::move(indexFile) };
-        case AppInstaller::Repository::Microsoft::SQLiteIndex::OpenDisposition::Immutable:
-        {
-            // Following the algorithm set forth at https://sqlite.org/uri.html [3.1] to convert to a URI path
-            // The execution order builds out the string so that it shouldn't require any moves (other than growing)
-            std::string target;
-            // Add an 'arbitrary' growth size to prevent the majority of needing to grow (adding 'file:/' and '?immutable=1')
-            target.reserve(filePath.size() + 20);
-
-            target += "file:";
-
-            bool wasLastCharSlash = false;
-
-            if (filePath.size() >= 2 && filePath[1] == ':' &&
-                ((filePath[0] >= 'a' && filePath[0] <= 'z') ||
-                 (filePath[0] >= 'A' && filePath[0] <= 'Z')))
-            {
-                target += '/';
-                wasLastCharSlash = true;
-            }
-
-            for (char c : filePath)
-            {
-                bool wasThisCharSlash = false;
-                switch (c)
-                {
-                case '?': target += "%3f"; break;
-                case '#': target += "%23"; break;
-                case '\\':
-                case '/':
-                {
-                    wasThisCharSlash = true;
-                    if (!wasLastCharSlash)
-                    {
-                        target += '/';
-                    }
-                    break;
-                }
-                default: target += c; break;
-                }
-
-                wasLastCharSlash = wasThisCharSlash;
-            }
-
-            target += "?immutable=1";
-
-            return { target, SQLite::Connection::OpenDisposition::ReadOnly, SQLite::Connection::OpenFlags::Uri, std::move(indexFile) };
-        }
-        default:
-            THROW_HR(E_UNEXPECTED);
-        }
+        return { filePath, disposition, std::move(indexFile) };
     }
 
-    SQLiteIndex::SQLiteIndex(const std::string& target, SQLite::Connection::OpenDisposition disposition, SQLite::Connection::OpenFlags flags, Utility::ManagedFile&& indexFile) :
-        m_dbconn(SQLite::Connection::Create(target, disposition, flags)), m_indexFile(std::move(indexFile))
+    SQLiteIndex SQLiteIndex::CopyFrom(const std::string& filePath, SQLiteIndex& source)
     {
-        m_dbconn.EnableICU();
-        m_version = Schema::Version::GetSchemaVersion(m_dbconn);
-        AICLI_LOG(Repo, Info, << "Opened SQLite Index with version [" << m_version << "], last write [" << GetLastWriteTime() << "]");
-        m_interface = m_version.CreateISQLiteIndex();
-        THROW_HR_IF(APPINSTALLER_CLI_ERROR_CANNOT_WRITE_TO_UPLEVEL_INDEX, disposition == SQLite::Connection::OpenDisposition::ReadWrite && m_version != m_interface->GetVersion());
+        return { filePath, source };
     }
 
-    SQLiteIndex::SQLiteIndex(const std::string& target, Schema::Version version) :
-        m_dbconn(SQLite::Connection::Create(target, SQLite::Connection::OpenDisposition::Create))
+    SQLiteIndex SQLiteIndex::OpenWithBaseline(
+        const std::string& deltaFilePath,
+        const std::string& baselineFilePath,
+        OpenDisposition disposition,
+        Utility::ManagedFile&& deltaFile,
+        Utility::ManagedFile&& baselineFile)
+    {
+        AICLI_LOG(Repo, Info, << "Opening delta index [" << deltaFilePath << "] with baseline [" << baselineFilePath << "]");
+
+        // The combined form is presented through views over a union of two databases, so there is
+        // nothing here that could be written back to.
+        THROW_HR_IF(E_INVALIDARG, disposition == OpenDisposition::ReadWrite);
+
+        std::filesystem::path baselinePath{ Utility::ConvertToUTF16(baselineFilePath) };
+        THROW_HR_IF(E_INVALIDARG, baselinePath.empty() || baselinePath.is_relative());
+
+        SQLiteIndex result{
+            SQLite::DatabaseSpecifier{ deltaFilePath, disposition },
+            InitializeFromMoveOnly<std::vector<Utility::ManagedFile>>({ std::move(deltaFile), std::move(baselineFile) }) };
+
+        // The interface for the delta's schema version establishes the combined view.
+        result.m_interface->SetupDeltaReadMode(result.m_dbconn, SQLite::DatabaseSpecifier{ baselineFilePath, disposition });
+
+        return result;
+    }
+
+    std::optional<SQLiteIndex::DeltaBaselineLocator> SQLiteIndex::GetDeltaBaselineLocator() const
+    {
+        std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        return m_interface->GetDeltaBaselineLocator(m_dbconn);
+    }
+
+    std::optional<std::string> SQLiteIndex::GetBaselineIdentifier() const
+    {
+        std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        return m_interface->GetBaselineIdentifier(m_dbconn);
+    }
+
+    SQLiteIndex::SQLiteIndex(const std::string& target, const SQLite::Version& version, CreateOptions options) : SQLiteStorageBase(target, version, GetPageSizeFromOptions(options))
     {
         m_dbconn.EnableICU();
-        m_interface = version.CreateISQLiteIndex();
+        m_interface = Schema::CreateISQLiteIndex(version);
         m_version = m_interface->GetVersion();
+        SetDatabaseFilePath(target);
+    }
+
+    SQLiteIndex::SQLiteIndex(const std::string& target, SQLiteStorageBase::OpenDisposition disposition, Utility::ManagedFile&& indexFile) :
+        SQLiteIndex(SQLite::DatabaseSpecifier{ target, disposition }, InitializeFromMoveOnly<std::vector<Utility::ManagedFile>>({ std::move(indexFile) }))
+    {
+    }
+
+    SQLiteIndex::SQLiteIndex(const SQLite::DatabaseSpecifier& specifier, std::vector<Utility::ManagedFile>&& files) :
+        SQLiteStorageBase(specifier, std::move(files))
+    {
+        m_dbconn.EnableICU();
+        AICLI_LOG(Repo, Info, << "Opened SQLite Index with version [" << m_version << "], last write [" << GetLastWriteTime() << "]");
+        m_interface = Schema::CreateISQLiteIndex(m_version);
+        THROW_HR_IF(APPINSTALLER_CLI_ERROR_CANNOT_WRITE_TO_UPLEVEL_INDEX, specifier.Disposition() == SQLiteStorageBase::OpenDisposition::ReadWrite && m_version != m_interface->GetVersion());
+        SetDatabaseFilePath(specifier.Path());
+    }
+
+    SQLiteIndex::SQLiteIndex(const std::string& target, SQLiteIndex& source) :
+        SQLiteStorageBase(target, source)
+    {
+        m_dbconn.EnableICU();
+        m_interface = Schema::CreateISQLiteIndex(m_version);
+        SetDatabaseFilePath(target);
+    }
+
+    void SQLiteIndex::SetDatabaseFilePath(const std::string& target)
+    {
+        if (target != SQLITE_MEMORY_DB_CONNECTION_TARGET)
+        {
+            m_contextData.Add<Schema::Property::DatabaseFilePath>(Utility::ConvertToUTF16(target));
+        }
     }
 
 #ifndef AICLI_DISABLE_TEST_HOOKS
-    void SQLiteIndex::ForceVersion(const Schema::Version& version)
+    void SQLiteIndex::ForceVersion(const SQLite::Version& version)
     {
-        m_interface = version.CreateISQLiteIndex();
+        m_interface = Schema::CreateISQLiteIndex(version);
+    }
+
+    SQLite::Version SQLiteIndex::GetLatestVersion()
+    {
+        return Schema::CreateISQLiteIndex(SQLite::Version::Latest())->GetVersion();
+    }
+
+    const Schema::SQLiteIndexContextData& SQLiteIndex::GetContextData() const
+    {
+        return m_contextData;
     }
 #endif
 
@@ -153,6 +160,11 @@ namespace AppInstaller::Repository::Microsoft
     SQLiteIndex::IdType SQLiteIndex::AddManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath)
     {
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        return AddManifestInternalHoldingLock(manifest, relativePath);
+    }
+
+    SQLiteIndex::IdType SQLiteIndex::AddManifestInternalHoldingLock(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath)
+    {
         AICLI_LOG(Repo, Verbose, << "Adding manifest for [" << manifest.Id << ", " << manifest.Version << "] at relative path [" << relativePath.value_or("") << "]");
 
         SQLite::Savepoint savepoint = SQLite::Savepoint::Create(m_dbconn, "sqliteindex_addmanifest");
@@ -187,6 +199,11 @@ namespace AppInstaller::Repository::Microsoft
     bool SQLiteIndex::UpdateManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath)
     {
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        return UpdateManifestInternalHoldingLock(manifest, relativePath);
+    }
+
+    bool SQLiteIndex::UpdateManifestInternalHoldingLock(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath)
+    {
         AICLI_LOG(Repo, Verbose, << "Updating manifest for [" << manifest.Id << ", " << manifest.Version << "] at relative path [" << relativePath.value_or("") << "]");
 
         SQLite::Savepoint savepoint = SQLite::Savepoint::Create(m_dbconn, "sqliteindex_updatemanifest");
@@ -201,6 +218,41 @@ namespace AppInstaller::Repository::Microsoft
         }
 
         return result;
+    }
+
+    bool SQLiteIndex::AddOrUpdateManifest(const std::filesystem::path& manifestPath, const std::filesystem::path& relativePath)
+    {
+        AICLI_LOG(Repo, Verbose, << "Adding or Updating manifest from file [" << manifestPath << "]");
+
+        Manifest::Manifest manifest = Manifest::YamlParser::CreateFromPath(manifestPath);
+        return AddOrUpdateManifestInternal(manifest, relativePath);
+    }
+
+    bool SQLiteIndex::AddOrUpdateManifest(const Manifest::Manifest& manifest, const std::filesystem::path& relativePath)
+    {
+        return AddOrUpdateManifestInternal(manifest, relativePath);
+    }
+
+    bool SQLiteIndex::AddOrUpdateManifest(const Manifest::Manifest& manifest)
+    {
+        return AddOrUpdateManifestInternal(manifest, {});
+    }
+
+    bool SQLiteIndex::AddOrUpdateManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath)
+    {
+        std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        AICLI_LOG(Repo, Verbose, << "Adding or Updating manifest for [" << manifest.Id << ", " << manifest.Version << "] at relative path [" << relativePath.value_or("") << "]");
+
+        if (m_interface->GetManifestIdByManifest(m_dbconn, manifest))
+        {
+            UpdateManifestInternalHoldingLock(manifest, relativePath);
+            return false;
+        }
+        else
+        {
+            AddManifestInternalHoldingLock(manifest, relativePath);
+            return true;
+        }
     }
 
     void SQLiteIndex::RemoveManifest(const std::filesystem::path& manifestPath, const std::filesystem::path& relativePath)
@@ -245,7 +297,7 @@ namespace AppInstaller::Repository::Microsoft
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
         AICLI_LOG(Repo, Info, << "Preparing index for packaging");
 
-        m_interface->PrepareForPackaging(m_dbconn);
+        m_interface->PrepareForPackaging(Schema::SQLiteIndexContext{ m_dbconn, m_contextData });
     }
 
     bool SQLiteIndex::CheckConsistency(bool log) const
@@ -253,7 +305,7 @@ namespace AppInstaller::Repository::Microsoft
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
         AICLI_LOG(Repo, Info, << "Checking index consistency...");
 
-        bool result = m_interface->CheckConsistency(m_dbconn, log);
+        bool result = m_interface->CheckConsistency(Schema::SQLiteIndexConstContext{ m_dbconn, m_contextData }, log);
 
         AICLI_LOG(Repo, Info, << "...index *WAS" << (result ? "*" : " NOT*") << " consistent.");
 
@@ -268,16 +320,16 @@ namespace AppInstaller::Repository::Microsoft
         return m_interface->Search(m_dbconn, request);
     }
 
-    std::optional<std::string> SQLiteIndex::GetPropertyByManifestId(IdType manifestId, PackageVersionProperty property) const
+    std::optional<std::string> SQLiteIndex::GetPropertyByPrimaryId(IdType primaryId, PackageVersionProperty property) const
     {
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
-        return m_interface->GetPropertyByManifestId(m_dbconn, manifestId, property);
+        return m_interface->GetPropertyByPrimaryId(m_dbconn, primaryId, property);
     }
 
-    std::vector<std::string> SQLiteIndex::GetMultiPropertyByManifestId(IdType manifestId, PackageVersionMultiProperty property) const
+    std::vector<std::string> SQLiteIndex::GetMultiPropertyByPrimaryId(IdType primaryId, PackageVersionMultiProperty property) const
     {
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
-        return m_interface->GetMultiPropertyByManifestId(m_dbconn, manifestId, property);
+        return m_interface->GetMultiPropertyByPrimaryId(m_dbconn, primaryId, property);
     }
 
     std::optional<SQLiteIndex::IdType> SQLiteIndex::GetManifestIdByKey(IdType id, std::string_view version, std::string_view channel) const
@@ -291,7 +343,7 @@ namespace AppInstaller::Repository::Microsoft
         return m_interface->GetManifestIdByManifest(m_dbconn, manifest);
     }
 
-    std::vector<Utility::VersionAndChannel> SQLiteIndex::GetVersionKeysById(IdType id) const
+    std::vector<SQLiteIndex::VersionKey> SQLiteIndex::GetVersionKeysById(IdType id) const
     {
         std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
         return m_interface->GetVersionKeysById(m_dbconn, id);
@@ -325,16 +377,81 @@ namespace AppInstaller::Repository::Microsoft
         return m_interface->GetDependentsById(m_dbconn, packageId);
     }
 
-    // Recording last write time based on MSDN documentation stating that time returns a POSIX epoch time and thus
-    // should be consistent across systems.
-    void SQLiteIndex::SetLastWriteTime()
+    bool SQLiteIndex::MigrateTo(SQLite::Version version)
     {
-        Schema::MetadataTable::SetNamedValue(m_dbconn, Schema::s_MetadataValueName_LastWriteTime, Utility::GetCurrentUnixEpoch());
+        std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+        SQLite::Savepoint savepoint = SQLite::Savepoint::Create(m_dbconn, "sqliteindex_migrate_to");
+
+        AICLI_LOG(Repo, Info, << "Attempting to migrate index from [" << m_interface->GetVersion() << "] to [" << version << "]...");
+        std::unique_ptr<Schema::ISQLiteIndex> newInterface = Schema::CreateISQLiteIndex(version);
+
+        bool result = newInterface->MigrateFrom(m_dbconn, m_interface.get());
+
+        AICLI_LOG(Repo, Info, << "...migration was " << (result ? "" : "NOT ") << "successful");
+        if (result)
+        {
+            version.SetSchemaVersion(m_dbconn);
+            SetLastWriteTime();
+            savepoint.Commit();
+
+            m_version = version;
+            m_interface = std::move(newInterface);
+        }
+
+        return result;
     }
 
-    std::chrono::system_clock::time_point SQLiteIndex::GetLastWriteTime()
+    void SQLiteIndex::SetProperty(Property property, const std::string& value)
     {
-        int64_t lastWriteTime = Schema::MetadataTable::GetNamedValue<int64_t>(m_dbconn, Schema::s_MetadataValueName_LastWriteTime);
-        return Utility::ConvertUnixEpochToSystemClock(lastWriteTime);
+        std::lock_guard<std::mutex> lockInterface{ *m_interfaceLock };
+
+        switch (property)
+        {
+        case Property::PackageUpdateTrackingBaseTime:
+            m_interface->SetProperty(m_dbconn, Schema::Property::PackageUpdateTrackingBaseTime, value);
+            break;
+        case Property::IntermediateFileOutputPath:
+        {
+            std::filesystem::path pathValue{ Utility::ConvertToUTF16(value) };
+            THROW_HR_IF(E_INVALIDARG, pathValue.empty() || pathValue.is_relative());
+            m_contextData.Add<Schema::Property::IntermediateFileOutputPath>(std::move(pathValue));
+        }
+            break;
+        case Property::DeltaBaselineIndexPath:
+        {
+            std::filesystem::path pathValue{ Utility::ConvertToUTF16(value) };
+            THROW_HR_IF(E_INVALIDARG, pathValue.empty() || pathValue.is_relative());
+            m_contextData.Add<Schema::Property::DeltaBaselineIndexPath>(std::move(pathValue));
+        }
+            break;
+        case Property::DeltaOutputPath:
+        {
+            std::filesystem::path pathValue{ Utility::ConvertToUTF16(value) };
+            THROW_HR_IF(E_INVALIDARG, pathValue.empty() || pathValue.is_relative());
+            m_contextData.Add<Schema::Property::DeltaOutputPath>(std::move(pathValue));
+        }
+            break;
+        case Property::DeltaBaselineRelativeSourcePath:
+            THROW_HR_IF(E_INVALIDARG, value.empty());
+            m_contextData.Add<Schema::Property::DeltaBaselineRelativeSourcePath>(value);
+            break;
+        case Property::DeltaBaselinePackageVersion:
+            THROW_HR_IF(E_INVALIDARG, value.empty());
+            m_contextData.Add<Schema::Property::DeltaBaselinePackageVersion>(value);
+            break;
+        case Property::DeltaMarkAsBaseline:
+            // An index is either being designated as a baseline or it is not, so there is no
+            // meaningful false: a caller that does not want one simply does not set this.
+            THROW_HR_IF(E_INVALIDARG, !Utility::CaseInsensitiveEquals(value, "true"));
+            m_contextData.Add<Schema::Property::DeltaMarkAsBaseline>(true);
+            break;
+        case Property::DeltaComparisonIndexPath:
+        {
+            std::filesystem::path pathValue{ Utility::ConvertToUTF16(value) };
+            THROW_HR_IF(E_INVALIDARG, pathValue.empty() || pathValue.is_relative());
+            m_contextData.Add<Schema::Property::DeltaComparisonIndexPath>(std::move(pathValue));
+        }
+            break;
+        }
     }
 }
